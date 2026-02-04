@@ -1,9 +1,13 @@
 import json
 from typing import List, Dict, Any, Optional
 from get_model_response import get_model_response
-
+import multiprocessing as mp
+from functools import partial
+import os
+import sys
+import signal
 # 配置常量
-MODEL_NAME = "gpt-5.2"
+MODEL_NAME = "doubao-seed-1-8"
 RETRY_COUNT = 3
 PROMPT_TEMPLATE = """
 Your current mission is to evaluate a value set. You should first analyze the System instruction and the User instruction. 
@@ -245,13 +249,113 @@ def _get_next_layer_nodes(nodes: List[Dict]) -> List[Dict]:
     return next_layer
 
 
-# 全局原则树实例
-principle_tree = PrincipleTree('/mnt/oss_data/llm_safety/datasets/value_principle_tree.json')
+# # 全局原则树实例
+# principle_tree = PrincipleTree('datasets/value_principle_tree.json')
+
+def init_worker(tree_path):
+    global principle_tree
+    principle_tree = PrincipleTree(tree_path)
+
+
+def process_single_query(query: str, tree_path: str) -> Dict[str, Any]:
+    # 每个进程必须有自己的 principle_tree 实例
+    local_tree = PrincipleTree(tree_path)
+    # root = local_tree.get_root()
+    # first_child = root["children"][0] if root.get("children") else {}
+    # print(f"DEBUG: First node ID in tree: {first_child.get('id', 'N/A')} (type: {type(first_child.get('id'))})")
+    tree_root = local_tree.get_root()
+
+    
+    try:
+        results = retrieve_principles_by_query_batch_global(tree_root, query, local_tree)
+        return {
+            "query": query,
+            "principle_ids": [r['id'] for r in results],
+            "principles": [r['principle'] for r in results]
+        }
+    except Exception as e:
+        print(f"❌ Error processing query: {query[:50]}... | Error: {e}")
+        return {
+            "query": query,
+            "principle_ids": [],
+            "principles": []
+        }
+
+
+def retrieve_principles_by_query_batch_global(tree_root: Dict, query: str, p_tree: PrincipleTree) -> List[Dict]:
+    matched_principles = []
+    current_layer_nodes = _get_first_layer_nodes(tree_root)
+    
+    while current_layer_nodes:
+        print(f"🔍 Processing layer with {len(current_layer_nodes)} candidates for query: {query[:30]}...")
+        
+        applicable_node_ids = batch_judge_applicable(current_layer_nodes, query)
+        
+        # 使用传入的 principle_tree 实例
+        applicable_nodes = []
+        for node_id in applicable_node_ids:
+            node = p_tree.get_node_by_id(node_id) 
+            if node:
+                applicable_nodes.append(node)
+            else:
+                print(f"⚠️ Node ID '{node_id}' not found")
+        
+        matched_principles.extend(applicable_nodes)
+        current_layer_nodes = _get_next_layer_nodes(applicable_nodes)
+    
+    return matched_principles
+
+
+def write_result_to_file(result, output_file):
+    """回调函数：在主进程中写入结果（线程安全）"""
+    with open(output_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+
+def main():
+    tree_path = 'datasets/value_principle_tree.json'
+    input_file = "/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all.json"
+    output_file = "/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all_retrieved_principles_tree_doubao_seed_1_8_test.json"
+
+    # 读取所有 queries
+    with open(input_file, 'r') as f:
+        data = json.load(f)
+    
+    queries = [d['query'] for d in data]
+
+    if not os.path.exists(output_file):
+        open(output_file, "w").close()
+
+    num_workers = min(2, os.cpu_count() or 8)
+    print(f"🚀 Starting parallel processing with {num_workers} workers for {len(queries)} queries...")
+
+    pool = mp.Pool(processes=num_workers, initializer=init_worker, initargs=(tree_path,))
+
+    try:
+        # 提交任务：使用 apply_async + callback
+        for query in queries:
+            pool.apply_async(
+                process_single_query,
+                args=(query, tree_path),
+                callback=lambda res: write_result_to_file(res, output_file)
+            )
+        
+        print("✅ All tasks submitted. Waiting for completion...")
+        pool.close()
+        pool.join()  # 等待所有任务完成
+        print("✅ All done!")
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Received Ctrl+C. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        print("🛑 Pool terminated.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     # 示例用法
-    query = "What do you think of strippers?"
+    # query = "What do you think of strippers?"
     # principles_str = ""
     # with open("/mnt/oss_data/llm_safety/datasets/value_principle_60_with_id.json",'r')as f:
     #     data = json.load(f)
@@ -267,13 +371,46 @@ if __name__ == "__main__":
     # )
     # print(response)
     # 确保使用的是原则树的根节点
-    tree_root = principle_tree.get_root()
-    # 执行检索
-    results = retrieve_principles_by_query_batch(tree_root, query)
+    # tree_root = principle_tree.get_root()
+    # with open("/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all.json",'r')as f:
+    #     data = json.load(f)
+    # with open("/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all_retrieved_principles_tree_doubao_seed_1_8.json",'w')as f:
+    #     for d in data:
+    #         query = d['query']
+    #         # 执行检索
+    #         results = retrieve_principles_by_query_batch(tree_root, query)
+    #         print("results:",results)
+    #         to_write = {"query":query, "principle_ids":[result['id'] for result in results], "principles":[result['principle'] for result in results]}
+    #         json.dump(to_write, f, ensure_ascii=False)
+    #         f.write("\n")   
+    # tree_path = 'datasets/value_principle_tree.json'
+    # input_file = "/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all.json"
+    # output_file = "/mnt/oss-llms/luoshi/llm_safety_alignment/datasets/hh-helpful-harmless-base-test-extracted-deduplicated-all_retrieved_principles_tree_doubao_seed_1_8_new.json"
+
+    # # 读取所有 queries
+    # with open(input_file, 'r') as f:
+    #     data = json.load(f)
     
-    # 打印结果
-    print(f"\n✅ Found {len(results)} applicable principles for query: '{query}'")
-    for i, p in enumerate(results, 1):
-        print(f"\n{i}. ID: {p['id']}")
-        print(f"Principle: {p['principle']}")
+    # queries = [d['query'] for d in data]
+    # queries = queries[1458:]
+
+    # # 设置进程数
+    # num_workers = min(16, os.cpu_count() or 8)  # 最多 16 个进程
+
+    # print(f"🚀 Starting parallel processing with {num_workers} workers...")
+
+    # # 使用 multiprocessing.Pool
+    # with mp.Pool(processes=num_workers, initializer=init_worker, initargs=(tree_path,)) as pool:
+    #     # 使用 partial 固定 tree_path 参数
+    #     worker_func = partial(process_single_query, tree_path=tree_path)
+    #     results = pool.map(worker_func, queries)
+
+    # # 写入结果
+    # with open(output_file, 'w', encoding='utf-8') as f:
+    #     for res in results:
+    #         json.dump(res, f, ensure_ascii=False)
+    #         f.write("\n")
+
+    # print(f"✅ All done! Results saved to {output_file}")
+    main()
 
